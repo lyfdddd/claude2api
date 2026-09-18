@@ -32,6 +32,7 @@ const (
 	upstreamHost = "claude.ai"
 	assetsHost   = "assets-proxy.anthropic.com"
 	ucHost       = "www.claudeusercontent.com"
+	artifactHost = "a.claude.ai"
 	authPrefix   = "/__auth/"
 	authAcctPath = "__acct/"
 )
@@ -94,19 +95,11 @@ func proxyDirector(req *http.Request) {
 	if pc == nil {
 		return
 	}
-	path := req.URL.RequestURI()
+	path := req.URL.Path
 
 	orig := req.Header.Clone()
 
-	var targetHost, scheme string
-	switch {
-	case !pc.onMain:
-		targetHost, scheme = ucHost, "https"
-	case strings.HasPrefix(path, "/claude-ai/") || strings.HasPrefix(path, "/api/assets/"):
-		targetHost, scheme = assetsHost, "https"
-	default:
-		targetHost, scheme = upstreamHost, "https"
-	}
+	targetHost, scheme := proxyTarget(path, pc.onMain)
 
 	req.URL.Scheme = scheme
 	req.URL.Host = targetHost
@@ -127,6 +120,31 @@ func proxyDirector(req *http.Request) {
 	req.Header.Set("origin", originURL)
 	req.Header.Set("referer", originURL+"/")
 	req.Header.Set("cookie", mergeProxyCookies(pc.browserCookies, cookieHeader(pc.record)))
+}
+
+func proxyTarget(path string, onMain bool) (string, string) {
+	switch {
+	case isArtifactRoute(path):
+		return artifactHost, "https"
+	case !onMain:
+		return ucHost, "https"
+	case strings.HasPrefix(path, "/claude-ai/") || strings.HasPrefix(path, "/api/assets/"):
+		return assetsHost, "https"
+	default:
+		return upstreamHost, "https"
+	}
+}
+
+func hasPathPrefix(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func isArtifactRoute(path string) bool {
+	return hasPathPrefix(path, "/api/frame") || hasPathPrefix(path, "/code/artifact")
+}
+
+func isArtifactNavigation(path string) bool {
+	return hasPathPrefix(path, "/code/artifact")
 }
 
 // maxRewriteBody 是 body 改写上限。
@@ -170,10 +188,13 @@ func proxyModifyResponse(resp *http.Response) error {
 				resp.Header.Add("Set-Cookie", "pool_acct=; Path=/; Max-Age=0")
 				continue
 			}
-			v = strings.ReplaceAll(v, "https://"+ucHost+"?", pc.ucOrig+"/?")
-			v = strings.ReplaceAll(v, "https://"+ucHost, pc.ucOrig)
-			v = strings.ReplaceAll(v, "https://"+upstreamHost, pc.mainOrig)
-			resp.Header.Set(k, v)
+			resp.Header.Set(k, rewriteResponseURL(v, pc.mainOrig, pc.ucOrig))
+		} else if lk == "link" {
+			vals := resp.Header.Values(k)
+			resp.Header.Del(k)
+			for _, v := range vals {
+				resp.Header.Add(k, rewriteResponseURL(v, pc.mainOrig, pc.ucOrig))
+			}
 		} else if lk == "set-cookie" {
 			vals := resp.Header.Values(k)
 			resp.Header.Del(k)
@@ -228,6 +249,27 @@ func proxyModifyResponse(resp *http.Response) error {
 }
 
 var domainStripRe = regexp.MustCompile(`;\s*[Dd]omain=[^;]+`)
+
+func rewriteResponseURL(value, mainOrigin, ucOrigin string) string {
+	ucNet := originNetloc(ucOrigin)
+	value = strings.ReplaceAll(value, "https://"+ucHost+"?", ucOrigin+"/?")
+	value = strings.ReplaceAll(value, "https://"+ucHost, ucOrigin)
+	value = strings.ReplaceAll(value, "https://claudeusercontent.com", ucOrigin)
+	value = strings.ReplaceAll(value, "https://"+artifactHost, ucOrigin)
+	value = strings.ReplaceAll(value, "//"+ucHost, "//"+ucNet)
+	value = strings.ReplaceAll(value, "//claudeusercontent.com", "//"+ucNet)
+	value = strings.ReplaceAll(value, "//"+artifactHost, "//"+ucNet)
+	value = strings.ReplaceAll(value, "https://"+upstreamHost, mainOrigin)
+	value = strings.ReplaceAll(value, "//"+upstreamHost, "//"+originNetloc(mainOrigin))
+	return value
+}
+
+func originNetloc(origin string) string {
+	if parts := strings.SplitN(origin, "//", 2); len(parts) == 2 {
+		return parts[1]
+	}
+	return origin
+}
 
 var (
 	loginSuspectLock sync.Mutex
@@ -356,6 +398,10 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 			return
 		}
 		ucOrig += authPrefix + ticket
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && isArtifactNavigation(r.URL.Path) {
+			http.Redirect(w, r, artifactRedirectURL(ucOrig, r.URL), http.StatusFound)
+			return
+		}
 	}
 	if !onMain {
 		ucOrig = requestOrigin(r)
@@ -381,6 +427,14 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 		}
 	}()
 	newProxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func artifactRedirectURL(ucOrigin string, requestURL *url.URL) string {
+	target := ucOrigin + requestURL.EscapedPath()
+	if requestURL.ForceQuery || requestURL.RawQuery != "" {
+		target += "?" + requestURL.RawQuery
+	}
+	return target
 }
 
 func artifactAuth(path string) (string, string, string, bool) {
@@ -520,6 +574,10 @@ func rewriteBody(data []byte, mainOrigin, ucOrigin string) []byte {
 	text = strings.ReplaceAll(text, "https://claudeusercontent.com", ucOrigin)
 	text = strings.ReplaceAll(text, ucHost, ucNet)
 	text = strings.ReplaceAll(text, "claudeusercontent.com", ucNet)
+	text = strings.ReplaceAll(text, "https://"+artifactHost+"/api/frame", ucOrigin+"/api/frame")
+	text = strings.ReplaceAll(text, "https://"+artifactHost+"/code/artifact", ucOrigin+"/code/artifact")
+	text = strings.ReplaceAll(text, "//"+artifactHost+"/api/frame", "//"+ucNet+"/api/frame")
+	text = strings.ReplaceAll(text, "//"+artifactHost+"/code/artifact", "//"+ucNet+"/code/artifact")
 	mainNet := mainOrigin
 	if p := strings.SplitN(mainOrigin, "//", 2); len(p) == 2 {
 		mainNet = p[1]
