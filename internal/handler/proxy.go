@@ -34,6 +34,7 @@ const (
 	ucHost       = "www.claudeusercontent.com"
 	artifactHost = "a.claude.ai"
 	authPrefix   = "/__auth/"
+	ucPathPrefix = "/_uc"
 	authAcctPath = "__acct/"
 )
 
@@ -59,12 +60,16 @@ var rewriteCT = []string{"text/html", "application/javascript", "text/javascript
 
 // proxyCtx 供 Director 和 ModifyResponse 共享。
 type proxyCtx struct {
-	record         *repository.Account
-	email          string
-	browserCookies string
-	onMain         bool
-	mainOrig       string
-	ucOrig         string
+	record           *repository.Account
+	email            string
+	browserCookies   string
+	downstreamHTTPS  bool
+	artifactTicketed bool
+	onMain           bool
+	mainOrig         string
+	artifactOrig     string
+	ucOrig           string
+	artifact         bool
 }
 
 type ctxKey struct{}
@@ -99,7 +104,7 @@ func proxyDirector(req *http.Request) {
 
 	orig := req.Header.Clone()
 
-	targetHost, scheme := proxyTarget(path, pc.onMain)
+	targetHost, scheme := proxyTarget(path, pc.onMain, pc.artifact)
 
 	req.URL.Scheme = scheme
 	req.URL.Host = targetHost
@@ -122,12 +127,14 @@ func proxyDirector(req *http.Request) {
 	req.Header.Set("cookie", mergeProxyCookies(pc.browserCookies, cookieHeader(pc.record)))
 }
 
-func proxyTarget(path string, onMain bool) (string, string) {
+func proxyTarget(path string, onMain, artifact bool) (string, string) {
 	switch {
-	case isArtifactRoute(path):
+	case !onMain && artifact:
 		return artifactHost, "https"
 	case !onMain:
 		return ucHost, "https"
+	case isArtifactNavigation(path):
+		return artifactHost, "https"
 	case strings.HasPrefix(path, "/claude-ai/") || strings.HasPrefix(path, "/api/assets/"):
 		return assetsHost, "https"
 	default:
@@ -139,12 +146,21 @@ func hasPathPrefix(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
-func isArtifactRoute(path string) bool {
-	return hasPathPrefix(path, "/api/frame") || hasPathPrefix(path, "/code/artifact")
-}
-
 func isArtifactNavigation(path string) bool {
 	return hasPathPrefix(path, "/code/artifact")
+}
+
+// sandboxUpstreamPath distinguishes legacy Claudeusercontent requests from
+// Artifact SPA requests on the sandbox host.
+func sandboxUpstreamPath(path string) (string, bool) {
+	if !hasPathPrefix(path, ucPathPrefix) {
+		return path, true
+	}
+	path = strings.TrimPrefix(path, ucPathPrefix)
+	if path == "" {
+		path = "/"
+	}
+	return path, false
 }
 
 // maxRewriteBody 是 body 改写上限。
@@ -163,6 +179,9 @@ func proxyModifyResponse(resp *http.Response) error {
 	}
 	ct := resp.Header.Get("content-type")
 	isStream := strings.Contains(ct, "text/event-stream")
+	if pc.artifactTicketed {
+		resp.Header.Set("Cache-Control", "no-store")
+	}
 
 	keys := make([]string, 0, len(resp.Header))
 	for k := range resp.Header {
@@ -188,21 +207,18 @@ func proxyModifyResponse(resp *http.Response) error {
 				resp.Header.Add("Set-Cookie", "pool_acct=; Path=/; Max-Age=0")
 				continue
 			}
-			resp.Header.Set(k, rewriteResponseURL(v, pc.mainOrig, pc.ucOrig))
+			resp.Header.Set(k, rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig))
 		} else if lk == "link" {
 			vals := resp.Header.Values(k)
 			resp.Header.Del(k)
 			for _, v := range vals {
-				resp.Header.Add(k, rewriteResponseURL(v, pc.mainOrig, pc.ucOrig))
+				resp.Header.Add(k, rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig))
 			}
 		} else if lk == "set-cookie" {
 			vals := resp.Header.Values(k)
 			resp.Header.Del(k)
 			for _, v := range vals {
-				v = domainStripRe.ReplaceAllString(v, "")
-				v = strings.ReplaceAll(v, "; Secure", "")
-				v = strings.ReplaceAll(v, "; secure", "")
-				resp.Header.Add(k, v)
+				resp.Header.Add(k, rewriteProxySetCookie(v, pc.downstreamHTTPS))
 			}
 		}
 	}
@@ -237,7 +253,7 @@ func proxyModifyResponse(resp *http.Response) error {
 	}
 	resp.Body.Close()
 	if needRewrite {
-		data = rewriteBody(data, pc.mainOrig, pc.ucOrig)
+		data = rewriteBody(data, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
 	}
 	if injectBar {
 		data = injectPoolBar(data, pc.email)
@@ -250,17 +266,60 @@ func proxyModifyResponse(resp *http.Response) error {
 
 var domainStripRe = regexp.MustCompile(`;\s*[Dd]omain=[^;]+`)
 
-func rewriteResponseURL(value, mainOrigin, ucOrigin string) string {
-	ucNet := originNetloc(ucOrigin)
-	value = strings.ReplaceAll(value, "https://"+ucHost+"?", ucOrigin+"/?")
-	value = strings.ReplaceAll(value, "https://"+ucHost, ucOrigin)
-	value = strings.ReplaceAll(value, "https://claudeusercontent.com", ucOrigin)
-	value = strings.ReplaceAll(value, "https://"+artifactHost, ucOrigin)
-	value = strings.ReplaceAll(value, "//"+ucHost, "//"+ucNet)
-	value = strings.ReplaceAll(value, "//claudeusercontent.com", "//"+ucNet)
-	value = strings.ReplaceAll(value, "//"+artifactHost, "//"+ucNet)
-	value = strings.ReplaceAll(value, "https://"+upstreamHost, mainOrigin)
-	value = strings.ReplaceAll(value, "//"+upstreamHost, "//"+originNetloc(mainOrigin))
+var artifactTargetOriginRe = regexp.MustCompile(`(?i)(["']?targetOrigin["']?\s*[:=]\s*["'])https://a\.claude\.ai/?(["'])`)
+
+func rewriteResponseURL(value, mainOrigin, artifactOrigin, ucOrigin string) string {
+	value = rewriteURLHost(value, ucHost, ucOrigin)
+	value = rewriteURLHost(value, "claudeusercontent.com", ucOrigin)
+	value = rewriteURLHost(value, artifactHost, artifactOrigin)
+	value = rewriteURLHost(value, upstreamHost, mainOrigin)
+	return value
+}
+
+// rewriteURLHost changes absolute and protocol-relative URL references. It is
+// used for response headers, where every host reference is a navigable URL.
+func rewriteURLHost(value, sourceHost, target string) string {
+	value = rewriteURLHostPaths(value, sourceHost, target)
+	return rewriteBareURLHost(value, sourceHost, target)
+}
+
+func rewriteBareURLHost(value, sourceHost, target string) string {
+	for _, suffix := range []string{`"`, `'`, "`", " ", "\t", "\r", "\n", ")", "]", "}", ",", ";", "<", ">"} {
+		value = strings.ReplaceAll(value, "https://"+sourceHost+suffix, target+suffix)
+		value = strings.ReplaceAll(value, "//"+sourceHost+suffix, "//"+originNetloc(target)+suffix)
+	}
+	if strings.HasSuffix(value, "https://"+sourceHost) {
+		value = strings.TrimSuffix(value, "https://"+sourceHost) + target
+	}
+	if strings.HasSuffix(value, "//"+sourceHost) {
+		value = strings.TrimSuffix(value, "//"+sourceHost) + "//" + originNetloc(target)
+	}
+	return value
+}
+
+func rewriteURLHostPaths(value, sourceHost, target string) string {
+	targetNet := originNetloc(target)
+	for _, suffix := range []string{"/", "?", "#"} {
+		value = strings.ReplaceAll(value, "https://"+sourceHost+suffix, target+suffix)
+		value = strings.ReplaceAll(value, "//"+sourceHost+suffix, "//"+targetNet+suffix)
+	}
+	return value
+}
+
+// rewriteArtifactBodyURLs keeps resource URLs on the ticketed sandbox entry,
+// but preserves a clean origin for postMessage targetOrigin comparisons.
+func rewriteArtifactBodyURLs(value, artifactURLBase string) string {
+	sandboxOrigin := originOnly(artifactURLBase)
+	value = artifactTargetOriginRe.ReplaceAllString(value, "${1}"+sandboxOrigin+"${2}")
+	value = rewriteURLHostPaths(value, artifactHost, artifactURLBase)
+	return rewriteBareURLHost(value, artifactHost, sandboxOrigin)
+}
+
+func originOnly(value string) string {
+	u, err := url.Parse(value)
+	if err == nil && u.Scheme != "" && u.Host != "" {
+		return u.Scheme + "://" + u.Host
+	}
 	return value
 }
 
@@ -278,9 +337,12 @@ var (
 
 const loginSuspectWindow = 10 * time.Minute
 
+const sandboxParentCookieName = "pool_parent"
+
 type artifactTicket struct {
 	credential string
 	email      string
+	mainOrigin string
 	expires    time.Time
 }
 
@@ -289,7 +351,7 @@ var artifactTickets = struct {
 	items map[string]artifactTicket
 }{items: map[string]artifactTicket{}}
 
-func issueArtifactTicket(credential, email string) (string, error) {
+func issueArtifactTicket(credential, email, mainOrigin string) (string, error) {
 	b := make([]byte, 24)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -302,9 +364,39 @@ func issueArtifactTicket(credential, email string) (string, error) {
 			delete(artifactTickets.items, key)
 		}
 	}
-	artifactTickets.items[token] = artifactTicket{credential, email, now.Add(10 * time.Minute)}
+	artifactTickets.items[token] = artifactTicket{credential: credential, email: email, mainOrigin: originOnly(mainOrigin), expires: now.Add(10 * time.Minute)}
 	artifactTickets.Unlock()
 	return token, nil
+}
+
+func artifactTicketForPath(path string) (artifactTicket, string, bool) {
+	token, cleanPath, ok := artifactTicketPath(path)
+	if !ok {
+		return artifactTicket{}, "", false
+	}
+	artifactTickets.Lock()
+	ticket, found := artifactTickets.items[token]
+	if found && time.Now().After(ticket.expires) {
+		delete(artifactTickets.items, token)
+		found = false
+	}
+	artifactTickets.Unlock()
+	if !found {
+		return artifactTicket{}, "", false
+	}
+	return ticket, cleanPath, true
+}
+
+func artifactTicketPath(path string) (string, string, bool) {
+	if !strings.HasPrefix(path, authPrefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(path, authPrefix)
+	token, cleanPath, _ := strings.Cut(rest, "/")
+	if token == "" {
+		return "", "", false
+	}
+	return token, "/" + cleanPath, true
 }
 
 // confirmLoginExpired 二次确认 /login 重定向。
@@ -342,6 +434,7 @@ func ServeUCProxy(c *gin.Context) {
 
 // ServeReverseProxy 是反代入口。
 func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
+	downstreamHTTPS := requestScheme(r) == "https"
 	credential := middleware.RequestCredential(r)
 	if onMain {
 		if !middleware.PoolCredentialValid(credential) {
@@ -349,18 +442,23 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 			return
 		}
 	}
-	artifactEmail := ""
 	if !onMain {
-		if pathCredential, pathAccount, path, ok := artifactAuth(r.URL.Path); ok {
-			if !middleware.PoolCredentialValid(pathCredential) {
+		if ticket, cleanPath, ok := artifactTicketForPath(r.URL.EscapedPath()); ok {
+			if !middleware.PoolCredentialValid(ticket.credential) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			credential = pathCredential
-			artifactEmail = pathAccount
-			middleware.SetAuthResponseCookie(w, r, credential)
-			r.URL.Path = path
-			r.URL.RawPath = ""
+			middleware.SetAuthResponseCookie(w, r, ticket.credential)
+			setSandboxTicketCookies(w, ticket, downstreamHTTPS)
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, sandboxRedirectURL(requestOrigin(r), cleanPath, r.URL), http.StatusTemporaryRedirect)
+			return
+		} else if _, cleanPath, ticketed := artifactTicketPath(r.URL.EscapedPath()); ticketed && middleware.PoolCredentialValid(credential) {
+			// An authenticated sandbox may encounter an expired ticket in a
+			// restored browser tab. Drop the ticket rather than proxying it upstream.
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, sandboxRedirectURL(requestOrigin(r), cleanPath, r.URL), http.StatusTemporaryRedirect)
+			return
 		} else if !middleware.PoolCredentialValid(credential) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -369,10 +467,6 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 
 	browserCookies := parseCookieHeader(r.Header.Get("Cookie"))
 	selected := browserCookies["pool_acct"]
-	if artifactEmail != "" {
-		selected = artifactEmail
-		http.SetCookie(w, &http.Cookie{Name: "pool_acct", Value: artifactEmail, Path: "/", MaxAge: 31536000})
-	}
 	record := service.AccountByEmail(selected)
 
 	if onMain {
@@ -390,32 +484,47 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 	}
 	email := record.Email
 	mainOrig := requestOrigin(r)
-	ucOrig := artifactOrigin(r)
+	artifactOrig := artifactOrigin(r)
+	ucOrig := strings.TrimRight(artifactOrig, "/") + ucPathPrefix
+	artifact := false
+	artifactTicketed := false
 	if onMain {
-		ticket, err := issueArtifactTicket(credential, email)
+		ticket, err := issueArtifactTicket(credential, email, mainOrig)
 		if err != nil {
 			http.Error(w, "artifact authorization unavailable", http.StatusInternalServerError)
 			return
 		}
-		ucOrig += authPrefix + ticket
+		artifactOrig += authPrefix + ticket
+		ucOrig = artifactOrig + ucPathPrefix
+		artifactTicketed = true
+		w.Header().Set("Cache-Control", "no-store")
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && isArtifactNavigation(r.URL.Path) {
-			http.Redirect(w, r, artifactRedirectURL(ucOrig, r.URL), http.StatusFound)
+			http.Redirect(w, r, artifactRedirectURL(artifactOrig, r.URL), http.StatusFound)
 			return
 		}
 	}
 	if !onMain {
-		ucOrig = requestOrigin(r)
-		if parentOrigin := strings.TrimSpace(r.URL.Query().Get("parentOrigin")); parentOrigin != "" {
-			mainOrig = parentOrigin
+		artifactOrig = requestOrigin(r)
+		ucOrig = strings.TrimRight(artifactOrig, "/") + ucPathPrefix
+		mainOrig = sandboxParentOrigin(browserCookies, r)
+		upstreamPath, isArtifact := sandboxUpstreamPath(r.URL.Path)
+		if upstreamPath != r.URL.Path {
+			r.URL.Path = upstreamPath
+			r.URL.RawPath = ""
 		}
+		artifact = isArtifact
 	}
 	pc := &proxyCtx{
-		record:         record,
-		email:          email,
-		browserCookies: r.Header.Get("Cookie"),
-		onMain:         onMain,
-		mainOrig:       mainOrig,
-		ucOrig:         ucOrig,
+		record:           record,
+		email:            email,
+		browserCookies:   r.Header.Get("Cookie"),
+		downstreamHTTPS:  downstreamHTTPS,
+		artifactTicketed: artifactTicketed,
+		onMain:           onMain,
+		mainOrig:         mainOrig,
+		artifactOrig:     artifactOrig,
+		ucOrig:           ucOrig,
+		artifact:         artifact,
 	}
 	ctx := context.WithValue(r.Context(), ctxKey{}, pc)
 	defer func() {
@@ -429,34 +538,48 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 	newProxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
-func artifactRedirectURL(ucOrigin string, requestURL *url.URL) string {
-	target := ucOrigin + requestURL.EscapedPath()
+func setSandboxTicketCookies(w http.ResponseWriter, ticket artifactTicket, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name: "pool_acct", Value: ticket.email, Path: "/", MaxAge: 31536000,
+		Secure: secure, SameSite: http.SameSiteLaxMode,
+	})
+	if parent := validHTTPOrigin(ticket.mainOrigin); parent != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name: sandboxParentCookieName, Value: url.QueryEscape(parent), Path: "/", MaxAge: 86400,
+			Secure: secure, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		})
+	}
+}
+
+func sandboxParentOrigin(cookies map[string]string, r *http.Request) string {
+	if parent := validHTTPOrigin(cookies[sandboxParentCookieName]); parent != "" {
+		return parent
+	}
+	return requestOrigin(r)
+}
+
+func validHTTPOrigin(value string) string {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func sandboxRedirectURL(sandboxOrigin, cleanPath string, requestURL *url.URL) string {
+	target := strings.TrimRight(sandboxOrigin, "/") + cleanPath
 	if requestURL.ForceQuery || requestURL.RawQuery != "" {
 		target += "?" + requestURL.RawQuery
 	}
 	return target
 }
 
-func artifactAuth(path string) (string, string, string, bool) {
-	if !strings.HasPrefix(path, authPrefix) {
-		return "", "", "", false
+func artifactRedirectURL(ucOrigin string, requestURL *url.URL) string {
+	target := ucOrigin + requestURL.EscapedPath()
+	if requestURL.ForceQuery || requestURL.RawQuery != "" {
+		target += "?" + requestURL.RawQuery
 	}
-	rest := strings.TrimPrefix(path, authPrefix)
-	token, path, _ := strings.Cut(rest, "/")
-	if token == "" {
-		return "", "", "", false
-	}
-	artifactTickets.Lock()
-	ticket, found := artifactTickets.items[token]
-	if found && time.Now().After(ticket.expires) {
-		delete(artifactTickets.items, token)
-		found = false
-	}
-	artifactTickets.Unlock()
-	if !found {
-		return "", "", "", false
-	}
-	return ticket.credential, ticket.email, "/" + path, true
+	return target
 }
 
 // IsUCHost 判断 artifact Host。
@@ -534,7 +657,7 @@ func mergeProxyCookies(browser, account string) string {
 	for _, header := range []string{browser, account} {
 		for _, part := range strings.Split(header, ";") {
 			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
-			if ok && name != middleware.AuthCookieName && name != "pool_acct" && name != "pool_cid" && name != "mirror" {
+			if ok && name != middleware.AuthCookieName && name != "pool_acct" && name != "pool_cid" && name != "mirror" && name != sandboxParentCookieName {
 				merged[name] = value
 			}
 		}
@@ -563,21 +686,11 @@ func parseCookieHeader(header string) map[string]string {
 }
 
 // rewriteBody 改写官网域名。
-func rewriteBody(data []byte, mainOrigin, ucOrigin string) []byte {
+func rewriteBody(data []byte, mainOrigin, artifactOrigin, ucOrigin string) []byte {
 	text := string(data)
-	ucNetloc := strings.SplitN(ucOrigin, "//", 2)
-	ucNet := ucOrigin
-	if len(ucNetloc) == 2 {
-		ucNet = ucNetloc[1]
-	}
-	text = strings.ReplaceAll(text, "https://"+ucHost, ucOrigin)
-	text = strings.ReplaceAll(text, "https://claudeusercontent.com", ucOrigin)
-	text = strings.ReplaceAll(text, ucHost, ucNet)
-	text = strings.ReplaceAll(text, "claudeusercontent.com", ucNet)
-	text = strings.ReplaceAll(text, "https://"+artifactHost+"/api/frame", ucOrigin+"/api/frame")
-	text = strings.ReplaceAll(text, "https://"+artifactHost+"/code/artifact", ucOrigin+"/code/artifact")
-	text = strings.ReplaceAll(text, "//"+artifactHost+"/api/frame", "//"+ucNet+"/api/frame")
-	text = strings.ReplaceAll(text, "//"+artifactHost+"/code/artifact", "//"+ucNet+"/code/artifact")
+	text = rewriteURLHost(text, ucHost, ucOrigin)
+	text = rewriteURLHost(text, "claudeusercontent.com", ucOrigin)
+	text = rewriteArtifactBodyURLs(text, artifactOrigin)
 	mainNet := mainOrigin
 	if p := strings.SplitN(mainOrigin, "//", 2); len(p) == 2 {
 		mainNet = p[1]
@@ -628,4 +741,12 @@ func injectPoolBar(data []byte, email string) []byte {
 
 	text = strings.Replace(text, "</body>", css+bar+"</body>", 1)
 	return []byte(text)
+}
+func rewriteProxySetCookie(value string, keepSecure bool) string {
+	value = domainStripRe.ReplaceAllString(value, "")
+	if !keepSecure {
+		value = strings.ReplaceAll(value, "; Secure", "")
+		value = strings.ReplaceAll(value, "; secure", "")
+	}
+	return value
 }

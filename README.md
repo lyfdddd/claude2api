@@ -22,7 +22,7 @@ Docker Compose 一键部署
 git clone https://github.com/basketikun/claude2api.git
 cd claude2api
 cp config.example.yaml config.yaml
-docker compose up -d
+docker compose up -d --build
 ```
 
 ## 核心功能
