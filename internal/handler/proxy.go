@@ -179,6 +179,7 @@ func proxyModifyResponse(resp *http.Response) error {
 	}
 	ct := resp.Header.Get("content-type")
 	isStream := strings.Contains(ct, "text/event-stream")
+	legacySandbox := !pc.onMain && !pc.artifact
 	if pc.artifactTicketed {
 		resp.Header.Set("Cache-Control", "no-store")
 	}
@@ -207,12 +208,20 @@ func proxyModifyResponse(resp *http.Response) error {
 				resp.Header.Add("Set-Cookie", "pool_acct=; Path=/; Max-Age=0")
 				continue
 			}
-			resp.Header.Set(k, rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig))
+			v = rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
+			if legacySandbox {
+				v = rewriteLegacyRootNextURLs(v)
+			}
+			resp.Header.Set(k, v)
 		} else if lk == "link" {
 			vals := resp.Header.Values(k)
 			resp.Header.Del(k)
 			for _, v := range vals {
-				resp.Header.Add(k, rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig))
+				v = rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
+				if legacySandbox {
+					v = rewriteLegacyRootNextURLs(v)
+				}
+				resp.Header.Add(k, v)
 			}
 		} else if lk == "set-cookie" {
 			vals := resp.Header.Values(k)
@@ -254,6 +263,9 @@ func proxyModifyResponse(resp *http.Response) error {
 	resp.Body.Close()
 	if needRewrite {
 		data = rewriteBody(data, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
+		if legacySandbox {
+			data = []byte(rewriteLegacyRootNextURLs(string(data)))
+		}
 	}
 	if injectBar {
 		data = injectPoolBar(data, pc.email)
@@ -267,6 +279,16 @@ func proxyModifyResponse(resp *http.Response) error {
 var domainStripRe = regexp.MustCompile(`;\s*[Dd]omain=[^;]+`)
 
 var artifactTargetOriginRe = regexp.MustCompile(`(?i)(["']?targetOrigin["']?\s*[:=]\s*["'])https://a\.claude\.ai/?(["'])`)
+
+// legacyRootNextURLRe matches root-relative Next.js resources in URL-bearing
+// contexts without touching absolute, protocol-relative, or already namespaced URLs.
+var legacyRootNextURLRe = regexp.MustCompile(`(^|["'\x60(<={:;,\[\s])/_next([/?#])`)
+
+var legacyEscapedRootNextURLRe = regexp.MustCompile(`(^|["'\x60(<={:;,\[\s])\\/_next((\\/)|[/?#])`)
+
+var legacyUnicodeRootNextURLRe = regexp.MustCompile(`(?i)(^|["'\x60(<={:;,\[\s])\\u002f_next((\\u002f)|[/?#])`)
+
+var legacyHexRootNextURLRe = regexp.MustCompile(`(?i)(^|["'\x60(<={:;,\[\s])\\x2f_next((\\x2f)|[/?#])`)
 
 func rewriteResponseURL(value, mainOrigin, artifactOrigin, ucOrigin string) string {
 	value = rewriteURLHost(value, ucHost, ucOrigin)
@@ -304,6 +326,15 @@ func rewriteURLHostPaths(value, sourceHost, target string) string {
 		value = strings.ReplaceAll(value, "//"+sourceHost+suffix, "//"+targetNet+suffix)
 	}
 	return value
+}
+
+// rewriteLegacyRootNextURLs keeps legacy root-relative Next.js assets in the
+// Claudeusercontent namespace, while clean sandbox assets remain Artifact assets.
+func rewriteLegacyRootNextURLs(value string) string {
+	value = legacyRootNextURLRe.ReplaceAllString(value, "${1}"+ucPathPrefix+"/_next${2}")
+	value = legacyEscapedRootNextURLRe.ReplaceAllString(value, "${1}\\/_uc\\/_next${2}")
+	value = legacyUnicodeRootNextURLRe.ReplaceAllString(value, "${1}\\u002F_uc\\u002F_next${2}")
+	return legacyHexRootNextURLRe.ReplaceAllString(value, "${1}\\x2F_uc\\x2F_next${2}")
 }
 
 // rewriteArtifactBodyURLs keeps resource URLs on the ticketed sandbox entry,

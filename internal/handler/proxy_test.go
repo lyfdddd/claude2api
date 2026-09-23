@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -62,6 +63,7 @@ func TestSandboxUpstreamPath(t *testing.T) {
 		{path: "/_next/app.js", wantPath: "/_next/app.js", wantArtifact: true},
 		{path: "/_uc", wantPath: "/", wantArtifact: false},
 		{path: "/_uc/file.js", wantPath: "/file.js", wantArtifact: false},
+		{path: "/_uc/_next/app.js", wantPath: "/_next/app.js", wantArtifact: false},
 		{path: "/_ucx/file.js", wantPath: "/_ucx/file.js", wantArtifact: true},
 	}
 	for _, tt := range tests {
@@ -198,5 +200,75 @@ func TestParseCookieHeaderPreservesPlusInAccountEmail(t *testing.T) {
 	}
 	if got, want := cookies[sandboxParentCookieName], "https://claude.example"; got != want {
 		t.Fatalf("pool_parent = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteLegacyRootNextURLs(t *testing.T) {
+	input := `href="/_next/static/site.css" src=/_next/static/app.js css=url(/_next/static/site.css) link=</_next/static/preload.js>; rel=preload location=/_next?x=1 hash=/_next#section json="\/_next\/static\/app.js" unicode="\u002F_next\u002Fstatic\u002Fapp.js" hex="\x2F_next\x2Fstatic\x2Fapp.js" already="/_uc/_next/ready.js" lookalike="/_nextish/app.js" absolute="https://a.claude.ai/_next/app.js" protocol="//a.claude.ai/_next/app.js"`
+	got := rewriteLegacyRootNextURLs(input)
+	for _, want := range []string{
+		`href="/_uc/_next/static/site.css"`,
+		`src=/_uc/_next/static/app.js`,
+		`url(/_uc/_next/static/site.css)`,
+		`</_uc/_next/static/preload.js>`,
+		`location=/_uc/_next?x=1`,
+		`hash=/_uc/_next#section`,
+		`json="\/_uc\/_next\/static\/app.js"`,
+		`unicode="\u002F_uc\u002F_next\u002Fstatic\u002Fapp.js"`,
+		`hex="\x2F_uc\x2F_next\x2Fstatic\x2Fapp.js"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("legacy Next rewrite missing %q: %q", want, got)
+		}
+	}
+	for _, want := range []string{
+		`/_uc/_next/ready.js`,
+		`/_nextish/app.js`,
+		`https://a.claude.ai/_next/app.js`,
+		`//a.claude.ai/_next/app.js`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("legacy Next rewrite changed %q: %q", want, got)
+		}
+	}
+	if again := rewriteLegacyRootNextURLs(got); again != got {
+		t.Fatalf("legacy Next rewrite was not idempotent: %q", again)
+	}
+}
+
+func TestLegacySandboxResponseNamespacesRootNextAssets(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://claudeapi.example/_uc?domain=claude.example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, &proxyCtx{
+		mainOrig:     "https://claude.example",
+		artifactOrig: "https://claudeapi.example",
+		ucOrig:       "https://claudeapi.example/_uc",
+	}))
+	resp := &http.Response{
+		Header: http.Header{
+			"Content-Type": []string{"text/html; charset=utf-8"},
+			"Link":         []string{`</_next/static/preload.js>; rel=preload`},
+			"Location":     []string{"/_next/static/redirect.js"},
+		},
+		Body:    io.NopCloser(strings.NewReader(`<link href="/_next/static/site.css"><script src="/_next/static/app.js"></script>`)),
+		Request: req,
+	}
+	if err := proxyModifyResponse(resp); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body); !strings.Contains(got, `/_uc/_next/static/site.css`) || !strings.Contains(got, `/_uc/_next/static/app.js`) {
+		t.Fatalf("legacy body did not namespace Next assets: %q", got)
+	}
+	if got := resp.Header.Get("Link"); !strings.Contains(got, `</_uc/_next/static/preload.js>`) {
+		t.Fatalf("legacy Link header = %q", got)
+	}
+	if got := resp.Header.Get("Location"); got != "/_uc/_next/static/redirect.js" {
+		t.Fatalf("legacy Location header = %q", got)
 	}
 }
