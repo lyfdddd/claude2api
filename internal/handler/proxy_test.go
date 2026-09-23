@@ -191,3 +191,12 @@ func TestSandboxParentOriginUsesTrustedCookie(t *testing.T) {
 		t.Fatalf("query parent origin was trusted: %q", got)
 	}
 }
+func TestParseCookieHeaderPreservesPlusInAccountEmail(t *testing.T) {
+	cookies := parseCookieHeader("pool_acct=user+artifact%40example.com; pool_parent=https%3A%2F%2Fclaude.example")
+	if got, want := cookies["pool_acct"], "user+artifact@example.com"; got != want {
+		t.Fatalf("pool_acct = %q, want %q", got, want)
+	}
+	if got, want := cookies[sandboxParentCookieName], "https://claude.example"; got != want {
+		t.Fatalf("pool_parent = %q, want %q", got, want)
+	}
+}

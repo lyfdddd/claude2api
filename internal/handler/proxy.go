@@ -674,14 +674,14 @@ func mergeProxyCookies(browser, account string) string {
 	return strings.Join(parts, "; ")
 }
 
-// parseCookieHeader 解析 Cookie，并还原 URL 编码值。
+// parseCookieHeader 解析 Cookie，并还原百分号编码值。
 func parseCookieHeader(header string) map[string]string {
 	out := map[string]string{}
 	for _, part := range strings.Split(header, ";") {
 		if i := strings.IndexByte(part, '='); i >= 0 {
 			key := strings.TrimSpace(part[:i])
 			val := strings.TrimSpace(part[i+1:])
-			if dec, err := url.QueryUnescape(val); err == nil {
+			if dec, err := url.PathUnescape(val); err == nil {
 				val = dec
 			}
 			out[key] = val
