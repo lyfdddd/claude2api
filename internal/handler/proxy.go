@@ -32,9 +32,12 @@ const (
 	upstreamHost = "claude.ai"
 	assetsHost   = "assets-proxy.anthropic.com"
 	ucHost       = "www.claudeusercontent.com"
+	// artifactHost remains a compatibility rewrite target for older Artifact
+	// payloads. Current Artifact viewers and API routes are served by claude.ai.
 	artifactHost = "a.claude.ai"
 	authPrefix   = "/__auth/"
 	ucPathPrefix = "/_uc"
+	framePathPrefix = "/_frame"
 	authAcctPath = "__acct/"
 )
 
@@ -69,7 +72,9 @@ type proxyCtx struct {
 	mainOrig         string
 	artifactOrig     string
 	ucOrig           string
-	artifact         bool
+	targetHost       string
+	legacy           bool
+	frameLabel       string
 }
 
 type ctxKey struct{}
@@ -104,7 +109,10 @@ func proxyDirector(req *http.Request) {
 
 	orig := req.Header.Clone()
 
-	targetHost, scheme := proxyTarget(path, pc.onMain, pc.artifact)
+	targetHost, scheme := pc.targetHost, "https"
+	if targetHost == "" {
+		targetHost, scheme = proxyTarget(path, pc.onMain)
+	}
 
 	req.URL.Scheme = scheme
 	req.URL.Host = targetHost
@@ -124,17 +132,19 @@ func proxyDirector(req *http.Request) {
 	originURL := scheme + "://" + targetHost
 	req.Header.Set("origin", originURL)
 	req.Header.Set("referer", originURL+"/")
-	req.Header.Set("cookie", mergeProxyCookies(pc.browserCookies, cookieHeader(pc.record)))
+	// Frame URLs contain a short-lived __frame_t token. Never send the selected
+	// Claude account session to a dynamic frame subdomain.
+	if pc.frameLabel == "" {
+		req.Header.Set("cookie", mergeProxyCookies(pc.browserCookies, cookieHeader(pc.record)))
+	}
 }
 
-func proxyTarget(path string, onMain, artifact bool) (string, string) {
+func proxyTarget(path string, onMain bool) (string, string) {
 	switch {
-	case !onMain && artifact:
-		return artifactHost, "https"
+	case isArtifactNavigation(path), isFrameAPIRoute(path):
+		return upstreamHost, "https"
 	case !onMain:
 		return ucHost, "https"
-	case isArtifactNavigation(path):
-		return artifactHost, "https"
 	case strings.HasPrefix(path, "/claude-ai/") || strings.HasPrefix(path, "/api/assets/"):
 		return assetsHost, "https"
 	default:
@@ -150,19 +160,81 @@ func isArtifactNavigation(path string) bool {
 	return hasPathPrefix(path, "/code/artifact")
 }
 
-// sandboxUpstreamPath distinguishes legacy Claudeusercontent requests from
-// Artifact SPA requests on the sandbox host.
-func sandboxUpstreamPath(path string) (string, bool) {
-	if !hasPathPrefix(path, ucPathPrefix) {
-		return path, true
-	}
-	path = strings.TrimPrefix(path, ucPathPrefix)
-	if path == "" {
-		path = "/"
-	}
-	return path, false
+func isFrameAPIRoute(path string) bool {
+	return hasPathPrefix(path, "/api/frame")
 }
 
+
+var frameLabelRe = regexp.MustCompile(`(?i)^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+type sandboxRoute struct {
+	upstreamPath string
+	targetHost   string
+	legacy       bool
+	frameLabel   string
+}
+
+func validFrameLabel(value string) string {
+	value = strings.ToLower(value)
+	if !frameLabelRe.MatchString(value) {
+		return ""
+	}
+	return value
+}
+
+func frameUpstreamHost(label string) string {
+	return label + ".frame.claudeusercontent.com"
+}
+
+func frameProxyURLBase(sandboxBase, label string) string {
+	return strings.TrimRight(sandboxBase, "/") + framePathPrefix + "/" + label
+}
+
+func allowsFrameMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+// sandboxRouteForPath parses the escaped downstream path. The dynamic frame
+// label is validated before unescaping, so it cannot become an arbitrary host.
+func sandboxRouteForPath(rawPath string) (sandboxRoute, bool) {
+	if rawPath == "" {
+		rawPath = "/"
+	}
+	if hasPathPrefix(rawPath, ucPathPrefix) {
+		upstreamRawPath := strings.TrimPrefix(rawPath, ucPathPrefix)
+		if upstreamRawPath == "" {
+			upstreamRawPath = "/"
+		}
+		upstreamPath, err := url.PathUnescape(upstreamRawPath)
+		if err != nil || !strings.HasPrefix(upstreamPath, "/") {
+			return sandboxRoute{}, false
+		}
+		return sandboxRoute{upstreamPath: upstreamPath, targetHost: ucHost, legacy: true}, true
+	}
+	if !hasPathPrefix(rawPath, framePathPrefix) {
+		return sandboxRoute{}, false
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(rawPath, framePathPrefix), "/")
+	label, upstreamRawPath, hasPath := strings.Cut(rest, "/")
+	label = validFrameLabel(label)
+	if label == "" {
+		return sandboxRoute{}, false
+	}
+	if !hasPath || upstreamRawPath == "" {
+		upstreamRawPath = "/"
+	} else {
+		upstreamRawPath = "/" + upstreamRawPath
+	}
+	upstreamPath, err := url.PathUnescape(upstreamRawPath)
+	if err != nil || !strings.HasPrefix(upstreamPath, "/") {
+		return sandboxRoute{}, false
+	}
+	return sandboxRoute{
+		upstreamPath: upstreamPath,
+		targetHost:   frameUpstreamHost(label),
+		frameLabel:   label,
+	}, true
+}
 // maxRewriteBody 是 body 改写上限。
 const maxRewriteBody = 10 << 20
 
@@ -179,9 +251,10 @@ func proxyModifyResponse(resp *http.Response) error {
 	}
 	ct := resp.Header.Get("content-type")
 	isStream := strings.Contains(ct, "text/event-stream")
-	legacySandbox := !pc.onMain && !pc.artifact
-	if pc.artifactTicketed {
-		resp.Header.Set("Cache-Control", "no-store")
+	legacySandbox := !pc.onMain && pc.legacy
+	frameSandbox := !pc.onMain && pc.frameLabel != ""
+	if pc.artifactTicketed || frameSandbox {
+		resp.Header.Set("Cache-Control", "private, no-store")
 	}
 
 	keys := make([]string, 0, len(resp.Header))
@@ -211,6 +284,8 @@ func proxyModifyResponse(resp *http.Response) error {
 			v = rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
 			if legacySandbox {
 				v = rewriteLegacyRootNextURLs(v)
+			} else if frameSandbox {
+				v = rewriteFrameHeaderRootURL(v, pc.frameLabel)
 			}
 			resp.Header.Set(k, v)
 		} else if lk == "link" {
@@ -220,20 +295,29 @@ func proxyModifyResponse(resp *http.Response) error {
 				v = rewriteResponseURL(v, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
 				if legacySandbox {
 					v = rewriteLegacyRootNextURLs(v)
+				} else if frameSandbox {
+					v = rewriteFrameHeaderRootURL(v, pc.frameLabel)
 				}
 				resp.Header.Add(k, v)
 			}
 		} else if lk == "set-cookie" {
 			vals := resp.Header.Values(k)
 			resp.Header.Del(k)
-			for _, v := range vals {
-				resp.Header.Add(k, rewriteProxySetCookie(v, pc.downstreamHTTPS))
+			if !frameSandbox {
+				for _, v := range vals {
+					resp.Header.Add(k, rewriteProxySetCookie(v, pc.downstreamHTTPS))
+				}
 			}
 		}
 	}
 
+	if frameSandbox {
+		resp.Header.Set("Service-Worker-Allowed", framePathPrefix+"/"+pc.frameLabel+"/")
+	}
 	if isStream {
-		resp.Header.Set("Cache-Control", "no-cache")
+		if !frameSandbox {
+			resp.Header.Set("Cache-Control", "no-cache")
+		}
 		return nil
 	}
 
@@ -262,9 +346,17 @@ func proxyModifyResponse(resp *http.Response) error {
 	}
 	resp.Body.Close()
 	if needRewrite {
-		data = rewriteBody(data, pc.mainOrig, pc.artifactOrig, pc.ucOrig)
+		text := string(data)
+		if pc.onMain {
+			text = rewriteMainPostMessageTargetOrigins(text, pc.artifactOrig)
+		} else if frameSandbox {
+			text = rewriteFramePostMessageTargetOrigins(text, pc.mainOrig)
+		}
+		data = rewriteBody([]byte(text), pc.mainOrig, pc.artifactOrig, pc.ucOrig)
 		if legacySandbox {
 			data = []byte(rewriteLegacyRootNextURLs(string(data)))
+		} else if frameSandbox {
+			data = []byte(rewriteFrameRootURLs(string(data), pc.frameLabel, ct))
 		}
 	}
 	if injectBar {
@@ -278,22 +370,13 @@ func proxyModifyResponse(resp *http.Response) error {
 
 var domainStripRe = regexp.MustCompile(`;\s*[Dd]omain=[^;]+`)
 
-var artifactTargetOriginRe = regexp.MustCompile(`(?i)(["']?targetOrigin["']?\s*[:=]\s*["'])https://a\.claude\.ai/?(["'])`)
-
-// legacyRootNextURLRe matches root-relative Next.js resources in URL-bearing
-// contexts without touching absolute, protocol-relative, or already namespaced URLs.
-var legacyRootNextURLRe = regexp.MustCompile(`(^|["'\x60(<={:;,\[\s])/_next([/?#])`)
-
-var legacyEscapedRootNextURLRe = regexp.MustCompile(`(^|["'\x60(<={:;,\[\s])\\/_next((\\/)|[/?#])`)
-
-var legacyUnicodeRootNextURLRe = regexp.MustCompile(`(?i)(^|["'\x60(<={:;,\[\s])\\u002f_next((\\u002f)|[/?#])`)
-
-var legacyHexRootNextURLRe = regexp.MustCompile(`(?i)(^|["'\x60(<={:;,\[\s])\\x2f_next((\\x2f)|[/?#])`)
-
 func rewriteResponseURL(value, mainOrigin, artifactOrigin, ucOrigin string) string {
 	value = rewriteURLHost(value, ucHost, ucOrigin)
 	value = rewriteURLHost(value, "claudeusercontent.com", ucOrigin)
-	value = rewriteURLHost(value, artifactHost, artifactOrigin)
+	// a.claude.ai is a legacy viewer host. Keep it on the main mirror rather
+	// than proxying it into the dynamic frame sandbox.
+	value = rewriteURLHost(value, artifactHost, mainOrigin)
+	value = rewriteFrameURLs(value, artifactOrigin)
 	value = rewriteURLHost(value, upstreamHost, mainOrigin)
 	return value
 }
@@ -328,6 +411,208 @@ func rewriteURLHostPaths(value, sourceHost, target string) string {
 	return value
 }
 
+var postMessageTargetOriginRe = regexp.MustCompile(`(?i)(["']?targetOrigin["']?\s*[:=]\s*["'])(https://([a-z0-9.-]+))/?(["'])`)
+
+func rewritePostMessageTargetOrigins(value, targetOrigin string, shouldRewrite func(string) bool) string {
+	targetOrigin = originOnly(targetOrigin)
+	if targetOrigin == "" {
+		return value
+	}
+	return postMessageTargetOriginRe.ReplaceAllStringFunc(value, func(match string) string {
+		parts := postMessageTargetOriginRe.FindStringSubmatch(match)
+		if len(parts) != 5 || !shouldRewrite(strings.ToLower(parts[3])) {
+			return match
+		}
+		return parts[1] + targetOrigin + parts[4]
+	})
+}
+
+func isDynamicFrameHost(host string) bool {
+	const suffix = ".frame.claudeusercontent.com"
+	host = strings.ToLower(host)
+	if !strings.HasSuffix(host, suffix) {
+		return false
+	}
+	return validFrameLabel(strings.TrimSuffix(host, suffix)) != ""
+}
+
+// Main-page code sends messages to the sandboxed child frame. Only those
+// frame origins and the legacy Artifact host are redirected to the sandbox.
+func rewriteMainPostMessageTargetOrigins(value, sandboxOrigin string) string {
+	return rewritePostMessageTargetOrigins(value, sandboxOrigin, func(host string) bool {
+		return host == artifactHost || isDynamicFrameHost(host)
+	})
+}
+
+// Frame code sends messages back to the mirrored main page. Never redirect
+// these parent targets to the sandbox origin.
+func rewriteFramePostMessageTargetOrigins(value, mainOrigin string) string {
+	return rewritePostMessageTargetOrigins(value, mainOrigin, func(host string) bool {
+		return host == upstreamHost || host == artifactHost
+	})
+}
+
+var frameAbsoluteURLRe = regexp.MustCompile(`(?i)(https?:)?//([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.frame\.claudeusercontent\.com([/?#]|\\/|\\u002f|$)`)
+var frameEscapedSlashURLRe = regexp.MustCompile(`(?i)(https?:)?(\\/)(\\/)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.frame\.claudeusercontent\.com(/|\\/|\\u002f|[?#]|$)`)
+var frameUnicodeSlashURLRe = regexp.MustCompile(`(?i)(https?:)?(\\u002f)(\\u002f)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.frame\.claudeusercontent\.com(/|\\/|\\u002f|[?#]|$)`)
+
+// rewriteFrameURLs sends only valid dynamic Claude frame origins through the
+// ticketed sandbox namespace. It preserves the following path and query bytes.
+func rewriteFrameURLs(value, sandboxBase string) string {
+	const frameHostSuffix = ".frame.claudeusercontent.com"
+	value = frameAbsoluteURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		lower := strings.ToLower(match)
+		hostEnd := strings.Index(lower, frameHostSuffix)
+		if hostEnd < 0 {
+			return match
+		}
+		head := match[:hostEnd]
+		label := validFrameLabel(head[strings.LastIndex(head, "//")+2:])
+		if label == "" {
+			return match
+		}
+		target := frameProxyURLBase(sandboxBase, label)
+		if strings.HasPrefix(match, "//") {
+			target = "//" + originNetloc(target)
+		}
+		return target + match[hostEnd+len(frameHostSuffix):]
+	})
+	value = rewriteEscapedFrameURLs(value, sandboxBase, frameEscapedSlashURLRe, `\/`)
+	return rewriteEscapedFrameURLs(value, sandboxBase, frameUnicodeSlashURLRe, `\u002F`)
+}
+
+func rewriteEscapedFrameURLs(value, sandboxBase string, re *regexp.Regexp, slash string) string {
+	const frameHostSuffix = ".frame.claudeusercontent.com"
+	return re.ReplaceAllStringFunc(value, func(match string) string {
+		parts := re.FindStringSubmatch(match)
+		if len(parts) < 5 {
+			return match
+		}
+		label := validFrameLabel(parts[4])
+		if label == "" {
+			return match
+		}
+		target := frameProxyURLBase(sandboxBase, label)
+		if parts[1] == "" {
+			target = "//" + originNetloc(target)
+		}
+		target = strings.ReplaceAll(target, "/", slash)
+		lower := strings.ToLower(match)
+		hostEnd := strings.Index(lower, frameHostSuffix)
+		if hostEnd < 0 {
+			return match
+		}
+		return target + match[hostEnd+len(frameHostSuffix):]
+	})
+}
+var frameQuotedRootURLRe = regexp.MustCompile(`(["'\x60])(/[^"'\x60<>\s)]*)`)
+var frameEscapedSlashRootURLRe = regexp.MustCompile(`(["'\x60])(\\/[^"'\x60<>\s)]*)`)
+var frameUnicodeSlashRootURLRe = regexp.MustCompile(`(?i)(["'\x60])(\\u002f[^"'\x60<>\s)]*)`)
+var frameHTMLUnquotedRootURLRe = regexp.MustCompile(`(?i)(\b(src|href|action|poster|data-src|data-href)\s*=\s*)/([^"'<>\s]*)`)
+var frameBaseHrefRe = regexp.MustCompile(`(?i)(<base\s+[^>]*\bhref\s*=\s*["'])/(["'])`)
+var frameCSSRootURLRe = regexp.MustCompile(`(?i)(url\(\s*)/([^"')\s]*)`)
+var frameHeaderRootURLRe = regexp.MustCompile(`(^|<)(/[^>\s,;]*)`)
+
+// rewriteFrameRootURLs keeps root-relative resources inside the current frame
+// namespace. It only changes URL-bearing contexts, never arbitrary JS syntax.
+func rewriteFrameRootURLs(value, label, contentType string) string {
+	base := framePathPrefix + "/" + label
+	value = rewriteFrameQuotedRootURLs(value, base)
+	if strings.Contains(contentType, "text/html") {
+		value = frameBaseHrefRe.ReplaceAllString(value, "${1}"+base+"/${2}")
+		value = rewriteFrameHTMLUnquotedRootURLs(value, base)
+	}
+	if strings.Contains(contentType, "text/css") {
+		value = rewriteFrameCSSRootURLs(value, base)
+	}
+	return value
+}
+
+func rewriteFrameQuotedRootURLs(value, base string) string {
+	value = frameQuotedRootURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		quote, path := match[:1], match[1:]
+		if shouldKeepFrameRootPath(path, base) {
+			return match
+		}
+		return quote + base + path
+	})
+	value = frameEscapedSlashRootURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		quote, path := match[:1], match[1:]
+		if len(path) < 2 || shouldKeepFrameRootPath(path[1:], base) {
+			return match
+		}
+		escapedBase := strings.ReplaceAll(base, "/", `\/`)
+		return quote + escapedBase + `\/` + path[2:]
+	})
+	return frameUnicodeSlashRootURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		quote, path := match[:1], match[1:]
+		if len(path) < len(`\u002F`) {
+			return match
+		}
+		rest := path[len(`\u002F`):]
+		if shouldKeepFrameRootPath("/"+rest, base) {
+			return match
+		}
+		escapedBase := strings.ReplaceAll(base, "/", `\u002F`)
+		return quote + escapedBase + `\u002F` + rest
+	})
+}
+
+func rewriteFrameHTMLUnquotedRootURLs(value, base string) string {
+	return frameHTMLUnquotedRootURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		parts := frameHTMLUnquotedRootURLRe.FindStringSubmatch(match)
+		if len(parts) < 4 {
+			return match
+		}
+		path := "/" + parts[3]
+		if shouldKeepFrameRootPath(path, base) {
+			return match
+		}
+		return parts[1] + base + path
+	})
+}
+
+func rewriteFrameCSSRootURLs(value, base string) string {
+	return frameCSSRootURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		parts := frameCSSRootURLRe.FindStringSubmatch(match)
+		if len(parts) < 3 {
+			return match
+		}
+		path := "/" + parts[2]
+		if shouldKeepFrameRootPath(path, base) {
+			return match
+		}
+		return parts[1] + base + path
+	})
+}
+
+func shouldKeepFrameRootPath(path, base string) bool {
+	return strings.HasPrefix(path, "//") || path == base ||
+		strings.HasPrefix(path, base+"/") || path == framePathPrefix ||
+		strings.HasPrefix(path, framePathPrefix+"/") || path == ucPathPrefix ||
+		strings.HasPrefix(path, ucPathPrefix+"/")
+}
+
+func rewriteFrameHeaderRootURL(value, label string) string {
+	base := framePathPrefix + "/" + label
+	return frameHeaderRootURLRe.ReplaceAllStringFunc(value, func(match string) string {
+		prefix, path := "", match
+		if strings.HasPrefix(match, "<") {
+			prefix, path = "<", match[1:]
+		}
+		if shouldKeepFrameRootPath(path, base) {
+			return match
+		}
+		return prefix + base + path
+	})
+}
+// legacyRootNextURLRe matches root-relative Next.js resources in URL-bearing
+// contexts without touching absolute, protocol-relative, or already namespaced URLs.
+var legacyRootNextURLRe = regexp.MustCompile(`(^|["'\x60(<={:;,\[\s])/_next([/?#])`)
+var legacyEscapedRootNextURLRe = regexp.MustCompile(`(^|["'\x60(<={:;,\[\s])\\/_next((\\/)|[/?#])`)
+var legacyUnicodeRootNextURLRe = regexp.MustCompile(`(?i)(^|["'\x60(<={:;,\[\s])\\u002f_next((\\u002f)|[/?#])`)
+var legacyHexRootNextURLRe = regexp.MustCompile(`(?i)(^|["'\x60(<={:;,\[\s])\\x2f_next((\\x2f)|[/?#])`)
+
 // rewriteLegacyRootNextURLs keeps legacy root-relative Next.js assets in the
 // Claudeusercontent namespace, while clean sandbox assets remain Artifact assets.
 func rewriteLegacyRootNextURLs(value string) string {
@@ -337,13 +622,10 @@ func rewriteLegacyRootNextURLs(value string) string {
 	return legacyHexRootNextURLRe.ReplaceAllString(value, "${1}\\x2F_uc\\x2F_next${2}")
 }
 
-// rewriteArtifactBodyURLs keeps resource URLs on the ticketed sandbox entry,
-// but preserves a clean origin for postMessage targetOrigin comparisons.
-func rewriteArtifactBodyURLs(value, artifactURLBase string) string {
-	sandboxOrigin := originOnly(artifactURLBase)
-	value = artifactTargetOriginRe.ReplaceAllString(value, "${1}"+sandboxOrigin+"${2}")
-	value = rewriteURLHostPaths(value, artifactHost, artifactURLBase)
-	return rewriteBareURLHost(value, artifactHost, sandboxOrigin)
+// rewriteArtifactBodyURLs keeps obsolete a.claude.ai references on the main
+// mirror. Current Artifact content is served from dynamic frame hosts instead.
+func rewriteArtifactBodyURLs(value, mainOrigin string) string {
+	return rewriteURLHost(value, artifactHost, mainOrigin)
 }
 
 func originOnly(value string) string {
@@ -368,7 +650,10 @@ var (
 
 const loginSuspectWindow = 10 * time.Minute
 
-const sandboxParentCookieName = "pool_parent"
+const (
+	sandboxParentCookieName  = "pool_parent"
+	sandboxBindingCookieName = "pool_sandbox_binding"
+)
 
 type artifactTicket struct {
 	credential string
@@ -382,6 +667,51 @@ var artifactTickets = struct {
 	items map[string]artifactTicket
 }{items: map[string]artifactTicket{}}
 
+type sandboxBinding struct {
+	email   string
+	expires time.Time
+}
+
+var sandboxBindings = struct {
+	sync.Mutex
+	items map[string]sandboxBinding
+}{items: map[string]sandboxBinding{}}
+
+func issueSandboxBinding(email string) (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	now := time.Now()
+	token := base64.RawURLEncoding.EncodeToString(b)
+	sandboxBindings.Lock()
+	for key, binding := range sandboxBindings.items {
+		if now.After(binding.expires) {
+			delete(sandboxBindings.items, key)
+		}
+	}
+	sandboxBindings.items[token] = sandboxBinding{email: email, expires: now.Add(24 * time.Hour)}
+	sandboxBindings.Unlock()
+	return token, nil
+}
+
+func sandboxBindingEmail(token string) string {
+	if token == "" {
+		return ""
+	}
+	now := time.Now()
+	sandboxBindings.Lock()
+	binding, found := sandboxBindings.items[token]
+	if found && now.After(binding.expires) {
+		delete(sandboxBindings.items, token)
+		found = false
+	}
+	sandboxBindings.Unlock()
+	if !found {
+		return ""
+	}
+	return binding.email
+}
 func issueArtifactTicket(credential, email, mainOrigin string) (string, error) {
 	b := make([]byte, 24)
 	if _, err := rand.Read(b); err != nil {
@@ -484,8 +814,13 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
+			binding, err := issueSandboxBinding(ticket.email)
+			if err != nil {
+				http.Error(w, "artifact authorization unavailable", http.StatusInternalServerError)
+				return
+			}
 			middleware.SetAuthResponseCookie(w, r, ticket.credential)
-			setSandboxTicketCookies(w, ticket, downstreamHTTPS)
+			setSandboxTicketCookies(w, ticket, binding, downstreamHTTPS)
 			w.Header().Set("Cache-Control", "no-store")
 			http.Redirect(w, r, sandboxRedirectURL(requestOrigin(r), cleanPath, r.URL), http.StatusTemporaryRedirect)
 			return
@@ -503,6 +838,13 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 
 	browserCookies := parseCookieHeader(r.Header.Get("Cookie"))
 	selected := browserCookies["pool_acct"]
+	if !onMain {
+		selected = sandboxBindingEmail(browserCookies[sandboxBindingCookieName])
+		if selected == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	record := service.AccountByEmail(selected)
 
 	if onMain {
@@ -522,7 +864,6 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 	mainOrig := requestOrigin(r)
 	artifactOrig := artifactOrigin(r)
 	ucOrig := strings.TrimRight(artifactOrig, "/") + ucPathPrefix
-	artifact := false
 	artifactTicketed := false
 	if onMain {
 		ticket, err := issueArtifactTicket(credential, email, mainOrig)
@@ -534,21 +875,25 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 		ucOrig = artifactOrig + ucPathPrefix
 		artifactTicketed = true
 		w.Header().Set("Cache-Control", "no-store")
-		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && isArtifactNavigation(r.URL.Path) {
-			http.Redirect(w, r, artifactRedirectURL(artifactOrig, r.URL), http.StatusFound)
-			return
-		}
 	}
+	var sandboxRoute sandboxRoute
 	if !onMain {
 		artifactOrig = requestOrigin(r)
 		ucOrig = strings.TrimRight(artifactOrig, "/") + ucPathPrefix
 		mainOrig = sandboxParentOrigin(browserCookies, r)
-		upstreamPath, isArtifact := sandboxUpstreamPath(r.URL.Path)
-		if upstreamPath != r.URL.Path {
-			r.URL.Path = upstreamPath
-			r.URL.RawPath = ""
+		var ok bool
+		sandboxRoute, ok = sandboxRouteForPath(r.URL.EscapedPath())
+		if !ok {
+			http.NotFound(w, r)
+			return
 		}
-		artifact = isArtifact
+		if sandboxRoute.frameLabel != "" && !allowsFrameMethod(r.Method) {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.URL.Path = sandboxRoute.upstreamPath
+		r.URL.RawPath = ""
 	}
 	pc := &proxyCtx{
 		record:           record,
@@ -560,7 +905,9 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 		mainOrig:         mainOrig,
 		artifactOrig:     artifactOrig,
 		ucOrig:           ucOrig,
-		artifact:         artifact,
+		targetHost:       sandboxRoute.targetHost,
+		legacy:           sandboxRoute.legacy,
+		frameLabel:       sandboxRoute.frameLabel,
 	}
 	ctx := context.WithValue(r.Context(), ctxKey{}, pc)
 	defer func() {
@@ -574,10 +921,10 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 	newProxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
-func setSandboxTicketCookies(w http.ResponseWriter, ticket artifactTicket, secure bool) {
+func setSandboxTicketCookies(w http.ResponseWriter, ticket artifactTicket, binding string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
-		Name: "pool_acct", Value: ticket.email, Path: "/", MaxAge: 31536000,
-		Secure: secure, SameSite: http.SameSiteLaxMode,
+		Name: sandboxBindingCookieName, Value: binding, Path: "/", MaxAge: 86400,
+		Secure: secure, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
 	if parent := validHTTPOrigin(ticket.mainOrigin); parent != "" {
 		http.SetCookie(w, &http.Cookie{
@@ -586,7 +933,6 @@ func setSandboxTicketCookies(w http.ResponseWriter, ticket artifactTicket, secur
 		})
 	}
 }
-
 func sandboxParentOrigin(cookies map[string]string, r *http.Request) string {
 	if parent := validHTTPOrigin(cookies[sandboxParentCookieName]); parent != "" {
 		return parent
@@ -693,7 +1039,7 @@ func mergeProxyCookies(browser, account string) string {
 	for _, header := range []string{browser, account} {
 		for _, part := range strings.Split(header, ";") {
 			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
-			if ok && name != middleware.AuthCookieName && name != "pool_acct" && name != "pool_cid" && name != "mirror" && name != sandboxParentCookieName {
+			if ok && name != middleware.AuthCookieName && name != "pool_acct" && name != "pool_cid" && name != "mirror" && name != sandboxParentCookieName && name != sandboxBindingCookieName {
 				merged[name] = value
 			}
 		}
@@ -726,7 +1072,8 @@ func rewriteBody(data []byte, mainOrigin, artifactOrigin, ucOrigin string) []byt
 	text := string(data)
 	text = rewriteURLHost(text, ucHost, ucOrigin)
 	text = rewriteURLHost(text, "claudeusercontent.com", ucOrigin)
-	text = rewriteArtifactBodyURLs(text, artifactOrigin)
+	text = rewriteArtifactBodyURLs(text, mainOrigin)
+	text = rewriteFrameURLs(text, artifactOrigin)
 	mainNet := mainOrigin
 	if p := strings.SplitN(mainOrigin, "//", 2); len(p) == 2 {
 		mainNet = p[1]
