@@ -37,9 +37,9 @@ func AdminAuth() gin.HandlerFunc {
 // PoolAuth 保护号池页面和接口。
 func PoolAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		credential := RequestCredential(c.Request)
-		if PoolCredentialValid(credential) {
-			if bearerToken(c.GetHeader("Authorization")) != "" {
+		credential := ValidPoolRequestCredential(c.Request)
+		if credential != "" {
+			if authorization := bearerToken(c.GetHeader("Authorization")); PoolCredentialValid(authorization) {
 				SetAuthCookie(c, credential)
 			}
 			c.Next()
@@ -74,7 +74,8 @@ func SetAuthResponseCookie(w http.ResponseWriter, r *http.Request, credential st
 	})
 }
 
-// RequestCredential 读取 Bearer 或 Cookie。
+// RequestCredential 读取首个 Bearer 或 Cookie。调用方若要做号池鉴权，
+// 应使用 ValidPoolRequestCredential，以免无效 Authorization 遮蔽有效 Cookie。
 func RequestCredential(r *http.Request) string {
 	if credential := bearerToken(r.Header.Get("Authorization")); credential != "" {
 		return credential
@@ -84,6 +85,50 @@ func RequestCredential(r *http.Request) string {
 		return ""
 	}
 	return cookie.Value
+}
+
+// ValidPoolRequestCredential 从请求中的所有候选凭据里选择有效凭据。
+// Artifact 上游可能带有与本站无关的 Authorization，不能让它覆盖浏览器
+// 已携带的本站 Cookie；同名旧 Cookie 也要逐个校验。
+func ValidPoolRequestCredential(r *http.Request) string {
+	return firstValidCredential(requestCredentialCandidates(r), PoolCredentialValid)
+}
+
+const maxPoolCredentialCandidates = 8
+
+func requestCredentialCandidates(r *http.Request) []string {
+	candidates := make([]string, 0, maxPoolCredentialCandidates)
+	seen := make(map[string]struct{}, maxPoolCredentialCandidates)
+	appendCandidate := func(credential string) {
+		if credential == "" || len(candidates) == maxPoolCredentialCandidates {
+			return
+		}
+		if _, exists := seen[credential]; exists {
+			return
+		}
+		seen[credential] = struct{}{}
+		candidates = append(candidates, credential)
+	}
+
+	appendCandidate(bearerToken(r.Header.Get("Authorization")))
+	for _, cookie := range r.Cookies() {
+		if len(candidates) == maxPoolCredentialCandidates {
+			break
+		}
+		if cookie.Name == AuthCookieName {
+			appendCandidate(cookie.Value)
+		}
+	}
+	return candidates
+}
+
+func firstValidCredential(candidates []string, valid func(string) bool) string {
+	for _, credential := range candidates {
+		if valid(credential) {
+			return credential
+		}
+	}
+	return ""
 }
 
 func AdminCredentialValid(credential string) bool {

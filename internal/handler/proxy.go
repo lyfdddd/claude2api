@@ -435,9 +435,9 @@ func ServeUCProxy(c *gin.Context) {
 // ServeReverseProxy 是反代入口。
 func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 	downstreamHTTPS := requestScheme(r) == "https"
-	credential := middleware.RequestCredential(r)
+	credential := middleware.ValidPoolRequestCredential(r)
 	if onMain {
-		if !middleware.PoolCredentialValid(credential) {
+		if credential == "" {
 			http.Redirect(w, r, "/", http.StatusFound)
 			return
 		}
@@ -445,6 +445,11 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 	if !onMain {
 		if ticket, cleanPath, ok := artifactTicketForPath(r.URL.EscapedPath()); ok {
 			if !middleware.PoolCredentialValid(ticket.credential) {
+				if credential != "" {
+					w.Header().Set("Cache-Control", "no-store")
+					http.Redirect(w, r, sandboxRedirectURL(requestOrigin(r), cleanPath, r.URL), http.StatusTemporaryRedirect)
+					return
+				}
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -453,13 +458,13 @@ func ServeReverseProxy(w http.ResponseWriter, r *http.Request, onMain bool) {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Redirect(w, r, sandboxRedirectURL(requestOrigin(r), cleanPath, r.URL), http.StatusTemporaryRedirect)
 			return
-		} else if _, cleanPath, ticketed := artifactTicketPath(r.URL.EscapedPath()); ticketed && middleware.PoolCredentialValid(credential) {
+		} else if _, cleanPath, ticketed := artifactTicketPath(r.URL.EscapedPath()); ticketed && credential != "" {
 			// An authenticated sandbox may encounter an expired ticket in a
 			// restored browser tab. Drop the ticket rather than proxying it upstream.
 			w.Header().Set("Cache-Control", "no-store")
 			http.Redirect(w, r, sandboxRedirectURL(requestOrigin(r), cleanPath, r.URL), http.StatusTemporaryRedirect)
 			return
-		} else if !middleware.PoolCredentialValid(credential) {
+		} else if credential == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
